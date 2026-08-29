@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+
 	"github.com/google/uuid"
 
 	"github.com/joho/godotenv"
@@ -42,7 +43,9 @@ func main () {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerGetNumOfReq)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerCfgReset)
 
-	mux.HandleFunc("POST /api/validate_chirp", handlerValidateChirp)
+	mux.HandleFunc("POST /api/chirps", apiCfg.handlerValidateChirp)
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetAllChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("GET /api/healthz", handlerHealtz)
 
@@ -140,13 +143,18 @@ func cleanBody(s string) string {
 	return result
 }
 
-func handlerValidateChirp(w http.ResponseWriter, req *http.Request) {
+func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, req *http.Request) {
 	type ValidateChirpParams struct {
         Body string `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
     }
 
 	type returnVals struct {
-        CleanedBody string `json:"cleaned_body"`
+        ID uuid.UUID `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Body string `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
     }
 
 	decoder := json.NewDecoder(req.Body)
@@ -164,12 +172,73 @@ func handlerValidateChirp(w http.ResponseWriter, req *http.Request) {
 
 	CBody := cleanBody(params.Body)
 
+	nullUUID := uuid.NullUUID{
+		UUID:  params.UserID,
+		Valid: true,
+	}
+
+	chirpsParams := database.CreateChirpParams{Body: CBody, UserID: nullUUID}
+	chirp, err := cfg.db.CreateChirp(req.Context(), chirpsParams)
+	if err != nil {
+		respondWithError(w, 400, "Failed to Create Chirp")
+	}
+
 	respBody := returnVals{
-        CleanedBody: CBody,
+        ID: chirp.ID,
+		CreatedAt: chirp.CreatedAt.String(),
+		UpdatedAt: chirp.UpdatedAt.String(),
+		Body: chirp.Body,
+		UserID: chirp.UserID.UUID,
     }
 
-	respondWithJSON(w, 200, respBody)
+	respondWithJSON(w, 201, respBody)
 
+}
+
+func (cfg *apiConfig) handlerGetAllChirps(w http.ResponseWriter, req *http.Request) {
+	type returnVals struct {
+        ID uuid.UUID `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Body string `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+    }
+
+	chirpsList, err := cfg.db.GetChirps(req.Context())
+	if err != nil {
+		respondWithError(w, 400, "Trouble Getting Chirps")
+	}
+
+	var returnList []returnVals
+
+	for _, chirp := range chirpsList {
+		returnList = append(returnList, returnVals{ID: chirp.ID, CreatedAt: chirp.CreatedAt.String(), UpdatedAt: chirp.UpdatedAt.String(), Body: chirp.Body, UserID: chirp.UserID.UUID})
+	}
+
+	respondWithJSON(w, 200, returnList)
+}
+
+func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, req *http.Request) {
+	type returnVals struct {
+        ID uuid.UUID `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Body string `json:"body"`
+		UserID uuid.UUID `json:"user_id"`
+    }
+
+	parsedID, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 400, "Error Parsing ID")
+	}
+
+	chirp, err := cfg.db.GetChirpByID(req.Context(), parsedID)
+	if err != nil {
+		respondWithError(w, 404, "Error Getting Chirp")
+	}
+
+	theValue := returnVals{ID: chirp.ID, CreatedAt: chirp.CreatedAt.String(), UpdatedAt: chirp.UpdatedAt.String(), Body: chirp.Body, UserID: chirp.UserID.UUID}
+	respondWithJSON(w, 200, theValue)
 }
 
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
