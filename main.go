@@ -1,6 +1,7 @@
 package main
 
 import (
+	"chirpy/internal/auth"
 	"chirpy/internal/database"
 	"database/sql"
 	"encoding/json"
@@ -10,7 +11,9 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/alexedwards/argon2id"
 	"github.com/google/uuid"
 
 	"github.com/joho/godotenv"
@@ -34,6 +37,9 @@ func main () {
 	}
 	dbQueries := database.New(db)
 
+	secret := os.Getenv("SECRET")
+	apiCfg.secret = secret
+
 	apiCfg.db = dbQueries
 	apiCfg.platform = os.Getenv("PLATFORM")
 
@@ -48,6 +54,9 @@ func main () {
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("GET /api/healthz", handlerHealtz)
+	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
 
 	server := http.Server{Handler: mux, Addr: ":8080"}
 
@@ -61,6 +70,25 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	db *database.Queries
 	platform string
+	secret string
+}
+
+func HashPassword(password string) (string, error) {
+	hash, err := argon2id.CreateHash(password, argon2id.DefaultParams)
+	if err != nil {
+		return "", err
+	}
+
+	return hash, nil
+}
+
+func CheckPasswordHash(password, hash string) (bool, error) {
+	match, err := argon2id.ComparePasswordAndHash(password, hash)
+	if err != nil {
+		return false, err
+	}
+
+	return match, nil
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -80,6 +108,7 @@ func (cfg *apiConfig) handlerGetNumOfReq(w http.ResponseWriter, req *http.Reques
 func (cfg *apiConfig) handlerCfgReset(w http.ResponseWriter, req *http.Request) {
 	if cfg.platform != "dev" {
 		respondWithError(w, 403, "Forbidden")
+		return
 	}
 	
 	cfg.fileserverHits.Store(0)
@@ -146,7 +175,6 @@ func cleanBody(s string) string {
 func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, req *http.Request) {
 	type ValidateChirpParams struct {
         Body string `json:"body"`
-		UserID uuid.UUID `json:"user_id"`
     }
 
 	type returnVals struct {
@@ -157,9 +185,21 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, req *http.Requ
 		UserID uuid.UUID `json:"user_id"`
     }
 
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Something went wrong")
+		return
+	}
+
+	UserID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Something went wrong")
+		return
+	}
+
 	decoder := json.NewDecoder(req.Body)
     params := ValidateChirpParams{}
-    err := decoder.Decode(&params)
+    err = decoder.Decode(&params)
     if err != nil {
 		respondWithError(w, 400, "Something went wrong")
 		return
@@ -173,7 +213,7 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, req *http.Requ
 	CBody := cleanBody(params.Body)
 
 	nullUUID := uuid.NullUUID{
-		UUID:  params.UserID,
+		UUID:  UserID,
 		Valid: true,
 	}
 
@@ -181,6 +221,7 @@ func (cfg *apiConfig) handlerValidateChirp(w http.ResponseWriter, req *http.Requ
 	chirp, err := cfg.db.CreateChirp(req.Context(), chirpsParams)
 	if err != nil {
 		respondWithError(w, 400, "Failed to Create Chirp")
+		return
 	}
 
 	respBody := returnVals{
@@ -207,6 +248,7 @@ func (cfg *apiConfig) handlerGetAllChirps(w http.ResponseWriter, req *http.Reque
 	chirpsList, err := cfg.db.GetChirps(req.Context())
 	if err != nil {
 		respondWithError(w, 400, "Trouble Getting Chirps")
+		return
 	}
 
 	var returnList []returnVals
@@ -230,11 +272,13 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, req *http.Request) 
 	parsedID, err := uuid.Parse(req.PathValue("chirpID"))
 	if err != nil {
 		respondWithError(w, 400, "Error Parsing ID")
+		return
 	}
 
 	chirp, err := cfg.db.GetChirpByID(req.Context(), parsedID)
 	if err != nil {
 		respondWithError(w, 404, "Error Getting Chirp")
+		return
 	}
 
 	theValue := returnVals{ID: chirp.ID, CreatedAt: chirp.CreatedAt.String(), UpdatedAt: chirp.UpdatedAt.String(), Body: chirp.Body, UserID: chirp.UserID.UUID}
@@ -244,6 +288,7 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, req *http.Request) 
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request) {
 	type userInfoParams struct {
 		Email string `json:"email"`
+		Password string `json:"password"`
 	}
 	type userReturnValues struct {
 		Id uuid.UUID `json:"id"`
@@ -262,7 +307,14 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 
 	ctx := req.Context()
 
-	user, err := cfg.db.CreateUser(ctx, params.Email)
+	hashPassword, err := auth.HashPassword(params.Password)
+	if err != nil {
+		respondWithError(w, 400, "Problem Hassing Password")
+	}
+
+	userParams := database.CreateUserParams{Email: params.Email, HashedPassword: hashPassword}
+
+	user, err := cfg.db.CreateUser(ctx, userParams)
 	if err != nil {
 		respondWithError(w, 400, "Error Creating User")
 		return
@@ -274,4 +326,120 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 	
 }
 
+func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
+	type userInfoParams struct {
+		Email string `json:"email"`
+		Password string `json:"password"`
+		ExipireIn int `json:"expires_in_seconds"`
+	}
+	type userReturnValues struct {
+		Id uuid.UUID `json:"id"`
+		CreatedAt string `json:"created_at"`
+		UpdatedAt string `json:"updated_at"`
+		Email string `json:"email"`
+		Refresh_Token string `json:"refresh_token"`
+		Token string `json:"token"`
+	}
 
+	decoder := json.NewDecoder(req.Body)
+    params := userInfoParams{}
+    err := decoder.Decode(&params)
+    if err != nil {
+		respondWithError(w, 400, "Something went wrong")
+		return
+    }
+
+	user, err := cfg.db.GetUserByEmail(req.Context(), params.Email)
+	if err != nil {
+		respondWithError(w, 401, "Incorrect email or password")
+		return
+    }
+
+	match, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
+	if err != nil {
+		respondWithError(w, 401, "Incorrect email or password")
+		return
+    }
+
+	if match == false {
+		respondWithError(w, 401, "Incorrect email or password")
+		return
+	}
+
+	token, err := auth.MakeJWT(user.ID, cfg.secret, time.Duration(3600) * time.Second)
+	if err != nil {
+		respondWithError(w, 400, "Trouble Logging In")
+		return
+	}
+
+	nullUUID := uuid.NullUUID{
+		UUID:  user.ID,
+		Valid: true, 
+	}
+
+	refreshTokenParams := database.CreateRefreshTokenParams{Token: auth.MakeRefreshToken(), ExpiresAt: time.Now().Add(time.Duration(86400) * time.Minute), UserID:  nullUUID}
+	refreshToken, err := cfg.db.CreateRefreshToken(req.Context(), refreshTokenParams)
+	if err != nil {
+		respondWithError(w, 401, "Trouble Logging In")
+		return
+	}
+
+	returnValues := userReturnValues{Id: user.ID, CreatedAt: user.CreatedAt.String(), UpdatedAt: user.UpdatedAt.String(), Email: user.Email, Token: token, Refresh_Token: refreshToken.Token}
+	respondWithJSON(w, 200, returnValues)
+}
+
+func (cfg *apiConfig) handlerRefresh (w http.ResponseWriter, req *http.Request) {
+	type returnValues struct {
+		Token string `json:"token"`
+	}
+
+	reqToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 400, "There was some problem")
+		return
+	}
+
+	refreshToken, err := cfg.db.GetRefreshTokenByTok(req.Context(), reqToken)
+	if err != nil {
+		respondWithError(w, 401, "Trouble Refreshing")
+		return
+	}
+
+	if time.Now().After(refreshToken.ExpiresAt) {
+		respondWithError(w, 401, "Trouble Refreshing")
+		return
+	}
+
+	if refreshToken.RevokedAt.Valid == true {
+		respondWithError(w, 401, "Trouble Refreshing")
+		return
+	}
+	
+	token, err := auth.MakeJWT(refreshToken.UserID.UUID, cfg.secret, time.Duration(3600) * time.Second)
+	if err != nil {
+		respondWithError(w, 401, "Trouble Refreshing")
+		return
+	}
+
+	returedValues := returnValues{Token: token}
+	respondWithJSON(w, 200, returedValues)
+}
+
+func (cfg *apiConfig) handlerRevoke (w http.ResponseWriter, req *http.Request) {
+	type returnValues struct {
+	}
+
+	reqToken, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 400, "There was some problem")
+		return
+	}
+
+	err = cfg.db.UpdateRevokeAt(req.Context(), reqToken)
+	if err != nil {
+		respondWithError(w, 400, "There was some problem")
+		return
+	}
+
+	respondWithJSON(w, 204, returnValues{})
+}
