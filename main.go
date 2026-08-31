@@ -50,13 +50,18 @@ func main () {
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerCfgReset)
 
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerValidateChirp)
-	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetAllChirps)
-	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
-	mux.HandleFunc("GET /api/healthz", handlerHealtz)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+
+	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetAllChirps)
+	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
+	mux.HandleFunc("GET /api/healthz", handlerHealtz)
+	
+	mux.HandleFunc("PUT /api/users", apiCfg.handlerUpdateEmailAndPass)
+
+	mux.HandleFunc("DELETE /api/chirps/{chirpID}", apiCfg.handlerDeleteChirp)
 
 	server := http.Server{Handler: mux, Addr: ":8080"}
 
@@ -438,6 +443,98 @@ func (cfg *apiConfig) handlerRevoke (w http.ResponseWriter, req *http.Request) {
 	err = cfg.db.UpdateRevokeAt(req.Context(), reqToken)
 	if err != nil {
 		respondWithError(w, 400, "There was some problem")
+		return
+	}
+
+	respondWithJSON(w, 204, returnValues{})
+}
+
+func (cfg *apiConfig) handlerUpdateEmailAndPass (w http.ResponseWriter, req *http.Request) {
+	type updateInfoParams struct {
+		Email string `json:"email"`
+		Password string `json:"password"`
+	}
+	type returnValues struct {
+		Email string `json:"email"`
+	}
+
+	decoder := json.NewDecoder(req.Body)
+    params := updateInfoParams{}
+    err := decoder.Decode(&params)
+    if err != nil {
+		respondWithError(w, 401, "Something went wrong")
+		return
+    }
+
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "There was some problem")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Unauthorised Access")
+		return
+	}
+
+	HPassword, err := auth.HashPassword(params.Password)
+
+	updateDBParams := database.UpdateUserEmailPassParams{Email: params.Email, HashedPassword: HPassword, ID: userID}
+
+	user, err := cfg.db.UpdateUserEmailPass(req.Context(), updateDBParams)
+	if err != nil {
+		respondWithError(w, 401, "Unauthorised Access")
+		return
+	}
+
+	returedValues := returnValues{Email: user.Email}
+	respondWithJSON(w, 200, returedValues)
+
+}
+
+func (cfg *apiConfig) handlerDeleteChirp (w http.ResponseWriter, req *http.Request) {
+	type returnValues struct {
+	}
+
+	token, err := auth.GetBearerToken(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Unauthorised Access")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.secret)
+	if err != nil {
+		respondWithError(w, 401, "Unauthorised Access")
+		return
+	}
+
+	nullUUID := uuid.NullUUID{
+		UUID:  userID,
+		Valid: true, 
+	}
+
+	parsedUUID, err := uuid.Parse(req.PathValue("chirpID"))
+	if err != nil {
+		respondWithError(w, 403, "Unauthorised Access3")
+		return
+	}
+
+	chirp, err := cfg.db.GetChirpByID(req.Context(), parsedUUID)
+	if err != nil {
+		respondWithError(w, 404, "Chirp Does Not Exist")
+		return
+	}
+	
+	if chirp.UserID.UUID != userID {
+		respondWithError(w, 403, "Unauthorised Access1")
+		return
+	}
+
+	deleteChirpDBParams := database.DeleteChirpParams{UserID: nullUUID, ID: chirp.ID}
+	err = cfg.db.DeleteChirp(req.Context(), deleteChirpDBParams)
+	if err != nil {
+		respondWithError(w, 400, "Somthing Went Wrong")
 		return
 	}
 
