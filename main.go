@@ -42,6 +42,7 @@ func main () {
 
 	apiCfg.db = dbQueries
 	apiCfg.platform = os.Getenv("PLATFORM")
+	apiCfg.polkaKey = os.Getenv("POLKA_KEY")
 
 	mux := http.NewServeMux()
 	mux.Handle("/app/", apiCfg.middlewareMetricsInc(http.StripPrefix("/app", http.FileServer(http.Dir(".")))))
@@ -54,6 +55,7 @@ func main () {
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
 	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
 	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
+	mux.HandleFunc("POST /api/polka/webhooks", apiCfg.handlerUpgradeToRed)
 
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetAllChirps)
 	mux.HandleFunc("GET /api/chirps/{chirpID}", apiCfg.handlerGetChirp)
@@ -76,6 +78,7 @@ type apiConfig struct {
 	db *database.Queries
 	platform string
 	secret string
+	polkaKey string
 }
 
 func HashPassword(password string) (string, error) {
@@ -250,7 +253,35 @@ func (cfg *apiConfig) handlerGetAllChirps(w http.ResponseWriter, req *http.Reque
 		UserID uuid.UUID `json:"user_id"`
     }
 
-	chirpsList, err := cfg.db.GetChirps(req.Context())
+	s := req.URL.Query().Get("author_id")
+
+	var userID uuid.UUID
+	var err error
+
+	if s != "" {
+		userID, err = uuid.Parse(s)
+		if err != nil {
+			respondWithError(w, 400, "Invalid User ID format")
+			return
+		}
+	} else {
+		userID = uuid.Nil
+	}
+
+	sortValue := req.URL.Query().Get("sort")
+
+	switch sortValue {
+		case "asc":
+			sortValue = "ASC"
+		case "desc":
+			sortValue = "DESC"
+		default:
+			sortValue = "ASC"
+    }
+
+	getChirpsParams := database.GetChirpsParams{Column1: userID, Column2: sortValue}
+
+	chirpsList, err := cfg.db.GetChirps(req.Context(), getChirpsParams)
 	if err != nil {
 		respondWithError(w, 400, "Trouble Getting Chirps")
 		return
@@ -300,6 +331,7 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 		CreatedAt string `json:"created_at"`
 		UpdatedAt string `json:"updated_at"`
 		Email string `json:"email"`
+		IsChirpRed bool `json:"is_chirpy_red"`
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -325,7 +357,7 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, req *http.Request
 		return
 	}
 
-	returnValues := userReturnValues{Id: user.ID, CreatedAt: user.CreatedAt.String(), UpdatedAt: user.UpdatedAt.String(), Email: user.Email}
+	returnValues := userReturnValues{Id: user.ID, CreatedAt: user.CreatedAt.String(), UpdatedAt: user.UpdatedAt.String(), Email: user.Email, IsChirpRed: user.IsChirpyRed}
 	respondWithJSON(w, 201, returnValues)
 
 	
@@ -344,6 +376,8 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
 		Email string `json:"email"`
 		Refresh_Token string `json:"refresh_token"`
 		Token string `json:"token"`
+		IsChirpRed bool `json:"is_chirpy_red"`
+		
 	}
 
 	decoder := json.NewDecoder(req.Body)
@@ -389,7 +423,7 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	returnValues := userReturnValues{Id: user.ID, CreatedAt: user.CreatedAt.String(), UpdatedAt: user.UpdatedAt.String(), Email: user.Email, Token: token, Refresh_Token: refreshToken.Token}
+	returnValues := userReturnValues{Id: user.ID, CreatedAt: user.CreatedAt.String(), UpdatedAt: user.UpdatedAt.String(), Email: user.Email, Token: token, Refresh_Token: refreshToken.Token, IsChirpRed: user.IsChirpyRed}
 	respondWithJSON(w, 200, returnValues)
 }
 
@@ -539,4 +573,47 @@ func (cfg *apiConfig) handlerDeleteChirp (w http.ResponseWriter, req *http.Reque
 	}
 
 	respondWithJSON(w, 204, returnValues{})
+}
+
+func (cfg *apiConfig) handlerUpgradeToRed (w http.ResponseWriter, req *http.Request) {
+	type insideData struct {
+		UserId uuid.UUID `json:"user_id"`
+	}
+	type upgradeInfoParams struct {
+		Event string `json:"event"`
+		Data insideData `json:"data"`
+	}
+	type emptyReturnValues struct {
+	}
+
+	apiKey, err := auth.GetAPIKey(req.Header)
+	if err != nil {
+		respondWithError(w, 401, "Could not get api key")
+		return
+	}
+	
+	if apiKey != cfg.polkaKey {
+		respondWithError(w, 401, "Something went wrong")
+		return
+	}
+	
+	decoder := json.NewDecoder(req.Body)
+    params := upgradeInfoParams{}
+    err = decoder.Decode(&params)
+    if err != nil {
+		respondWithError(w, 401, "Something went wrong")
+		return
+    }
+
+	if params.Event == "user.upgraded" {
+		respondWithJSON(w, 204, emptyReturnValues{})
+	}
+
+	err = cfg.db.UpgradeChirpyRedByID(req.Context(), params.Data.UserId)
+	if err != nil {
+		respondWithError(w, 404, "User Can't Be found")
+		return
+	}
+
+	respondWithJSON(w, 204, emptyReturnValues{})
 }

@@ -12,7 +12,10 @@ RETURNING *;
 -- name: GetChirps :many
 SELECT *
 FROM chirps
-ORDER BY created_at ASC;
+WHERE ($1::uuid = '00000000-0000-0000-0000-000000000000'::uuid OR user_id = $1)
+ORDER BY
+    CASE WHEN $2::text = 'DESC' THEN created_at END DESC,
+    CASE WHEN $2::text = 'ASC' THEN created_at END ASC;;
 
 -- name: GetChirpByID :one
 SELECT *
